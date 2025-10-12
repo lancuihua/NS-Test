@@ -27,6 +27,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import open_clip
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms as T
 from torchvision.datasets import ImageFolder
@@ -266,6 +267,31 @@ def evaluate_merged_encoder(
     return results
 
 
+def load_base_model(
+    checkpoint: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    clip_arch: str,
+    clip_pretrained: Optional[str],
+) -> torch.nn.Module:
+    obj = torch.load(checkpoint, map_location="cpu")
+    if isinstance(obj, torch.nn.Module):
+        model = obj
+    else:
+        state_dict = obj.get("state_dict", obj)
+        model, _, _ = open_clip.create_model_and_transforms(
+            clip_arch,
+            pretrained=clip_pretrained,
+            device=torch.device("cpu"),
+        )
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[warn] Missing keys when loading base checkpoint: {missing}")
+        if unexpected:
+            print(f"[warn] Unexpected keys when loading base checkpoint: {unexpected}")
+    return model.to(device=device, dtype=dtype)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Null-space constrained merging for ViT checkpoints."
@@ -352,6 +378,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Number of dominant singular directions to preserve when --preserve_mode=svd.",
+    )
+    parser.add_argument(
+        "--clip_model",
+        type=str,
+        default="ViT-B-32",
+        help="CLIP vision backbone name used when instantiating models from state dict checkpoints.",
+    )
+    parser.add_argument(
+        "--clip_pretrained",
+        type=str,
+        default=None,
+        help="Optional CLIP pretrained identifier; set to 'openai' for official weights when reconstructing models from state dicts.",
     )
     parser.add_argument(
         "--layer_regex",
@@ -450,8 +488,13 @@ def main() -> None:
     device = torch.device(args.device)
 
     # Load base model for gradient collection (float32 for stability).
-    base_model = torch.load(args.base_checkpoint, map_location=device)
-    base_model = base_model.to(device=device, dtype=torch.float32)
+    base_model = load_base_model(
+        checkpoint=args.base_checkpoint,
+        device=device,
+        dtype=torch.float32,
+        clip_arch=args.clip_model,
+        clip_pretrained=args.clip_pretrained,
+    )
     base_model.eval()
 
     # Determine preserve transform from the model if available.
