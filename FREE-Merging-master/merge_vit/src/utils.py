@@ -25,13 +25,35 @@ def dict2namespace(config):
     return namespace
 
 def safe_load_state_dict(weights_path: str):
-    try:
-        state_dict = torch.load(weights_path).state_dict()
-    except:
-        with open(weights_path, "rb") as f:
-            obj = f.read()
-        state_dict = pickle.loads(obj, encoding="latin1").state_dict()
-    return state_dict
+    obj = torch.load(weights_path, map_location="cpu")
+
+    # Case 1: the checkpoint is already a state dict.
+    if isinstance(obj, dict):
+        # Common conventions used by various training scripts.
+        for key in ["state_dict", "model_state_dict", "module", "model"]:
+            maybe_state = obj.get(key)
+            if hasattr(maybe_state, "state_dict"):
+                return maybe_state.state_dict()
+            if isinstance(maybe_state, dict):
+                return maybe_state
+        # If all tensor-like, treat as state dict directly.
+        if all(isinstance(v, torch.Tensor) for v in obj.values()):
+            return obj
+
+    # Case 2: torch.save(model) -> an nn.Module object.
+    if hasattr(obj, "state_dict"):
+        return obj.state_dict()
+
+    # Case 3: fallback to pickle (old checkpoints). Some files are raw pickled modules.
+    with open(weights_path, "rb") as f:
+        payload = f.read()
+    loaded = pickle.loads(payload, encoding="latin1")
+    if hasattr(loaded, "state_dict"):
+        return loaded.state_dict()
+    if isinstance(loaded, dict):
+        return loaded
+
+    raise RuntimeError(f"Unable to extract state dict from checkpoint: {weights_path}")
 
 def read_config(args):
     yml_path="{}/{}_{}_{}.yaml".format(args.config_root_path,args.model,args.task,args.method)
