@@ -162,6 +162,30 @@ def compute_nullspace_bases(
     return bases
 
 
+def compute_svd_preserve_bases(
+    model: torch.nn.Module,
+    parameter_pool: Dict[str, torch.nn.Parameter],
+    max_rank: int,
+) -> Dict[str, torch.Tensor]:
+    """Build preservation bases from dominant singular directions of parameters."""
+    bases: Dict[str, torch.Tensor] = {}
+    state = dict(model.named_parameters())
+    for name in parameter_pool:
+        tensor = state[name].detach()
+        if tensor.ndim < 2:
+            continue
+        flat = tensor.view(tensor.shape[0], -1).float()
+        rank = min(max_rank, flat.shape[0], flat.shape[1])
+        if rank <= 0:
+            continue
+        try:
+            _, _, Vh = torch.linalg.svd(flat, full_matrices=False)
+        except RuntimeError:
+            continue
+        bases[name] = Vh[:rank].contiguous()
+    return bases
+
+
 def project_delta(
     delta: torch.Tensor,
     basis: Optional[torch.Tensor],
@@ -656,25 +680,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-def compute_svd_preserve_bases(
-    model: torch.nn.Module,
-    parameter_pool: Dict[str, torch.nn.Parameter],
-    max_rank: int,
-) -> Dict[str, torch.Tensor]:
-    """Build preservation bases from the dominant singular directions of each weight matrix."""
-    bases: Dict[str, torch.Tensor] = {}
-    state = dict(model.named_parameters())
-    for name, param in parameter_pool.items():
-        tensor = state[name].detach()
-        if tensor.ndim < 2:
-            continue
-        flat = tensor.view(tensor.shape[0], -1).float()
-        try:
-            _, _, Vh = torch.linalg.svd(flat, full_matrices=False)
-        except RuntimeError:
-            continue
-        rank = min(max_rank, Vh.shape[0])
-        if rank <= 0:
-            continue
-        bases[name] = Vh[:rank].contiguous()
-    return bases
