@@ -296,7 +296,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preserve_data",
         type=Path,
-        required=True,
+        default=None,
         help="Directory containing preserve images structured for torchvision ImageFolder.",
     )
     parser.add_argument(
@@ -340,6 +340,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on null-space rank per parameter.",
+    )
+    parser.add_argument(
+        "--preserve_mode",
+        choices=["dataset", "svd"],
+        default="dataset",
+        help="Strategy for constructing preservation bases. 'dataset' builds AlphaEdit-style bases from gradients; 'svd' protects dominant singular directions of weights (data-free).",
+    )
+    parser.add_argument(
+        "--svd_rank",
+        type=int,
+        default=8,
+        help="Number of dominant singular directions to preserve when --preserve_mode=svd.",
     )
     parser.add_argument(
         "--layer_regex",
@@ -461,32 +473,44 @@ def main() -> None:
             ]
         )
 
-    dataset = load_image_dataset(
-        dataset_path=args.preserve_data,
-        transform=transform,
-        max_samples=args.max_samples,
-        seed=args.seed,
-    )
-    dataloader = create_dataloader(
-        dataset=dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
-
     parameter_filters = compile_layer_filter(args.layer_regex)
     parameter_pool = filter_parameters(base_model, parameter_filters)
+    bases: Dict[str, torch.Tensor]
 
-    gradients = gather_preserve_gradients(
-        model=base_model,
-        dataloader=dataloader,
-        parameter_pool=parameter_pool,
-        device=device,
-    )
-    bases = compute_nullspace_bases(
-        gradients=gradients,
-        max_rank=args.max_rank,
-        svd_threshold=args.svd_threshold,
-    )
+    if args.preserve_mode == "dataset":
+        if not args.preserve_data:
+            raise ValueError("--preserve_data is required when --preserve_mode=dataset.")
+        dataset = load_image_dataset(
+            dataset_path=args.preserve_data,
+            transform=transform,
+            max_samples=args.max_samples,
+            seed=args.seed,
+        )
+        dataloader = create_dataloader(
+            dataset=dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        gradients = gather_preserve_gradients(
+            model=base_model,
+            dataloader=dataloader,
+            parameter_pool=parameter_pool,
+            device=device,
+        )
+        bases = compute_nullspace_bases(
+            gradients=gradients,
+            max_rank=args.max_rank,
+            svd_threshold=args.svd_threshold,
+        )
+    else:  # svd mode
+        rank = args.svd_rank
+        if args.max_rank is not None:
+            rank = min(rank, args.max_rank)
+        bases = compute_svd_preserve_bases(
+            model=base_model,
+            parameter_pool=parameter_pool,
+            max_rank=rank,
+        )
 
     base_state = {
         name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()
@@ -558,12 +582,16 @@ def main() -> None:
         "nullspace_strength": args.nullspace_strength,
         "svd_threshold": args.svd_threshold,
         "max_rank": args.max_rank,
+        "preserve_mode": args.preserve_mode,
         "layer_regex": args.layer_regex,
         "protected_layers": {k: int(v.shape[0]) for k, v in bases.items()},
-        "preserve_data": str(args.preserve_data),
-        "max_samples": args.max_samples,
-        "batch_size": args.batch_size,
     }
+    if args.preserve_mode == "dataset":
+        metadata["preserve_data"] = str(args.preserve_data)
+        metadata["max_samples"] = args.max_samples
+        metadata["batch_size"] = args.batch_size
+    else:
+        metadata["svd_rank"] = args.svd_rank
     if eval_results is not None and eval_datasets is not None and eval_output_path is not None:
         metadata["evaluation"] = {
             "datasets": eval_datasets,
@@ -585,3 +613,25 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+def compute_svd_preserve_bases(
+    model: torch.nn.Module,
+    parameter_pool: Dict[str, torch.nn.Parameter],
+    max_rank: int,
+) -> Dict[str, torch.Tensor]:
+    """Build preservation bases from the dominant singular directions of each weight matrix."""
+    bases: Dict[str, torch.Tensor] = {}
+    state = dict(model.named_parameters())
+    for name, param in parameter_pool.items():
+        tensor = state[name].detach()
+        if tensor.ndim < 2:
+            continue
+        flat = tensor.view(tensor.shape[0], -1).float()
+        try:
+            _, _, Vh = torch.linalg.svd(flat, full_matrices=False)
+        except RuntimeError:
+            continue
+        rank = min(max_rank, Vh.shape[0])
+        if rank <= 0:
+            continue
+        bases[name] = Vh[:rank].contiguous()
+    return bases
