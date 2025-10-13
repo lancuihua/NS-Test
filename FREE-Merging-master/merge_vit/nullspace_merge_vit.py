@@ -54,6 +54,14 @@ def compile_layer_filter(patterns: Iterable[str]) -> List[re.Pattern]:
     return compiled
 
 
+def _flatten_like(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.reshape(1, -1)
+
+
+def _reshape_like(row: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    return row.reshape(like.shape)
+
+
 def filter_parameters(
     model: torch.nn.Module, filters: List[re.Pattern]
 ) -> Dict[str, torch.nn.Parameter]:
@@ -193,12 +201,53 @@ def project_delta(
 ) -> torch.Tensor:
     if basis is None or basis.numel() == 0:
         return delta
-    flat = delta.view(-1)
+    flat = delta.reshape(-1)
     B = basis.to(flat.device)
     coeffs = torch.matmul(B, flat)
     correction = torch.matmul(coeffs, B)
     flat_proj = flat - strength * correction
-    return flat_proj.view_as(delta)
+    return flat_proj.reshape_as(delta)
+
+
+def _project_onto_basis(row: torch.Tensor, basis: Optional[torch.Tensor]) -> torch.Tensor:
+    if basis is None or basis.numel() == 0:
+        return row
+    B = basis.to(row.device)
+    return (row @ B.t()) @ B
+
+
+def _remove_basis_component(row: torch.Tensor, basis: Optional[torch.Tensor]) -> torch.Tensor:
+    if basis is None or basis.numel() == 0:
+        return row
+    B = basis.to(row.device)
+    return row - (row @ B.t()) @ B
+
+
+def _proj_guard_and_shared(row: torch.Tensor, guard_basis: Optional[torch.Tensor], shared_basis: Optional[torch.Tensor]) -> torch.Tensor:
+    v = row
+    v = _project_onto_basis(v, shared_basis)
+    v = _remove_basis_component(v, guard_basis)
+    return v
+
+
+def _build_shared_subspace(rows: List[torch.Tensor], rank: int) -> Optional[torch.Tensor]:
+    if rank <= 0 or not rows:
+        return None
+    X = torch.cat(rows, dim=0)
+    if X.shape[0] == 1:
+        vec = F.normalize(X[0], dim=0, eps=1e-6).unsqueeze(0)
+        return vec
+    Xc = X - X.mean(dim=0, keepdim=True)
+    try:
+        _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    except RuntimeError:
+        return None
+    if Vh.shape[0] == 0:
+        return None
+    r = min(rank, Vh.shape[0])
+    if r <= 0:
+        return None
+    return Vh[:r].contiguous()
 
 
 def merge_with_nullspace(
@@ -206,6 +255,11 @@ def merge_with_nullspace(
     expert_states: List[Tuple[Dict[str, torch.Tensor], float]],
     bases: Dict[str, torch.Tensor],
     strength: float,
+    apgd_steps: int,
+    apgd_lr: float,
+    shared_rank: int,
+    alpha_mode: str,
+    alpha_beta: float,
 ) -> Dict[str, torch.Tensor]:
     merged: Dict[str, torch.Tensor] = {}
     for name, base_tensor in base_state.items():
@@ -214,18 +268,61 @@ def merge_with_nullspace(
             continue
 
         base_f32 = base_tensor.to(torch.float32)
-        update = torch.zeros_like(base_f32)
         basis = bases.get(name)
+        rows: List[torch.Tensor] = []
+        row_weights: List[float] = []
 
         for expert_state, weight in expert_states:
             if name not in expert_state:
                 continue
             expert_tensor = expert_state[name].to(torch.float32)
+            if expert_tensor.shape != base_f32.shape:
+                print(
+                    f"[warn] Shape mismatch for parameter '{name}': base {tuple(base_f32.shape)} vs expert {tuple(expert_tensor.shape)}. Skipping this expert.",
+                    flush=True,
+                )
+                continue
             delta = expert_tensor - base_f32
             delta = project_delta(delta, basis, strength)
-            update = update + weight * delta
+            row = _flatten_like(delta)
+            rows.append(row)
+            row_weights.append(weight)
 
-        merged[name] = (base_f32 + update).to(base_tensor.dtype)
+        if not rows:
+            merged[name] = base_tensor.clone()
+            continue
+
+        rows_tensor = torch.cat(rows, dim=0)  # K x F
+        weight_tensor = torch.tensor(row_weights, device=rows_tensor.device, dtype=rows_tensor.dtype).view(-1, 1)
+        weight_tensor = weight_tensor / weight_tensor.sum().clamp_min(1e-12)
+        delta_row = (weight_tensor * rows_tensor).sum(dim=0, keepdim=True)
+
+        shared_basis = _build_shared_subspace(rows, shared_rank)
+
+        if apgd_steps > 0:
+            for _ in range(apgd_steps):
+                if alpha_mode == "uniform":
+                    lam = torch.ones(rows_tensor.shape[0], device=rows_tensor.device, dtype=rows_tensor.dtype)
+                else:
+                    d2 = torch.sum((rows_tensor - delta_row) ** 2, dim=1)
+                    if alpha_mode == "distance":
+                        lam = torch.softmax(alpha_beta * d2, dim=0)
+                    elif alpha_mode == "nci_balanced":
+                        lam = torch.softmax(alpha_beta * d2, dim=0)
+                        mu = rows_tensor.mean(dim=0, keepdim=True)
+                        cos = (F.normalize(rows_tensor, dim=1) @ F.normalize(mu, dim=1).t()).squeeze(1).clamp_min(1e-6)
+                        lam = lam / cos
+                    else:
+                        lam = torch.ones(rows_tensor.shape[0], device=rows_tensor.device, dtype=rows_tensor.dtype)
+                lam = lam / lam.sum().clamp_min(1e-12)
+                grad = 2.0 * torch.sum(lam.view(-1, 1) * (delta_row - rows_tensor), dim=0, keepdim=True)
+                delta_row = delta_row - apgd_lr * grad
+                delta_row = _proj_guard_and_shared(delta_row, basis, shared_basis)
+        else:
+            delta_row = _proj_guard_and_shared(delta_row, basis, shared_basis)
+
+        delta_tensor = _reshape_like(delta_row, base_f32)
+        merged[name] = (base_f32 + delta_tensor).to(base_tensor.dtype)
     return merged
 
 
@@ -402,6 +499,36 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Number of dominant singular directions to preserve when --preserve_mode=svd.",
+    )
+    parser.add_argument(
+        "--apgd_steps",
+        type=int,
+        default=0,
+        help="Number of projected gradient refinement steps in the null-space (0 disables APGD).",
+    )
+    parser.add_argument(
+        "--apgd_lr",
+        type=float,
+        default=0.5,
+        help="Step size for APGD refinement.",
+    )
+    parser.add_argument(
+        "--shared_rank",
+        type=int,
+        default=8,
+        help="Rank of task-shared subspace used during APGD refinement.",
+    )
+    parser.add_argument(
+        "--alpha_mode",
+        choices=["uniform", "distance", "nci_balanced"],
+        default="distance",
+        help="Adaptive coefficient strategy for APGD.",
+    )
+    parser.add_argument(
+        "--alpha_beta",
+        type=float,
+        default=1.0,
+        help="Sharpness parameter for adaptive coefficients when alpha_mode != 'uniform'.",
     )
     parser.add_argument(
         "--clip_model",
@@ -603,6 +730,11 @@ def main() -> None:
         expert_states=expert_states,
         bases=bases,
         strength=args.nullspace_strength,
+        apgd_steps=args.apgd_steps,
+        apgd_lr=args.apgd_lr,
+        shared_rank=args.shared_rank,
+        alpha_mode=args.alpha_mode,
+        alpha_beta=args.alpha_beta,
     )
 
     output_dir = Path(args.output_dir)
@@ -652,6 +784,11 @@ def main() -> None:
         "preserve_mode": args.preserve_mode,
         "layer_regex": args.layer_regex,
         "protected_layers": {k: int(v.shape[0]) for k, v in bases.items()},
+        "apgd_steps": args.apgd_steps,
+        "apgd_lr": args.apgd_lr,
+        "shared_rank": args.shared_rank,
+        "alpha_mode": args.alpha_mode,
+        "alpha_beta": args.alpha_beta,
     }
     if args.preserve_mode == "dataset":
         metadata["preserve_data"] = str(args.preserve_data)
