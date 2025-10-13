@@ -201,13 +201,19 @@ def project_delta(
 ) -> torch.Tensor:
     if basis is None or basis.numel() == 0:
         return delta
-    flat = delta.reshape(-1)
-    B = basis.to(flat.device)
-    coeffs = torch.matmul(B, flat)
-    correction = torch.matmul(coeffs, B)
+    # Match the reshaping used in compute_svd_preserve_bases
+    original_shape = delta.shape
+    if delta.ndim < 2:
+        flat = delta.view(-1).unsqueeze(0)  # Make it 2D for consistency
+    else:
+        flat = delta.view(delta.shape[0], -1)  # Match SVD computation: (shape[0], -1)
+    
+    B = basis.to(flat.device)  # B shape: (rank, feature_dim)
+    # Project each row of flat
+    coeffs = torch.matmul(flat, B.T)  # (batch, rank)
+    correction = torch.matmul(coeffs, B)  # (batch, feature_dim)
     flat_proj = flat - strength * correction
-    return flat_proj.reshape_as(delta)
-
+    return flat_proj.view(original_shape)
 
 def _project_onto_basis(row: torch.Tensor, basis: Optional[torch.Tensor]) -> torch.Tensor:
     if basis is None or basis.numel() == 0:
