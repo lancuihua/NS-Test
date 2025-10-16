@@ -1,18 +1,22 @@
 """
-Null-space constrained merging for vision transformers.
+Shared subspace constrained merging for vision transformers.
 
-This script mirrors the FREE-Merging ViT pipeline, but projects expert
-updates onto the null space of a preserve dataset before fusing them into the
-base checkpoint. The idea follows AlphaEdit: directions that would change the
-outputs on critical samples are removed prior to merging.
+This script implements the "A method" workflow:
+  1. Load a base checkpoint and a list of expert checkpoints with the same
+     architecture.
+  2. For every selected parameter tensor, build task vectors
+     DeltaW = W_expert - W_base and reshape them to [out_dim, -1].
+  3. Stack task vectors column-wise, compute their output-side covariance,
+     and extract the top-k eigenvectors to form the shared left subspace U_k.
+  4. Project every non-anchor task vector onto the orthogonal complement of U_k
+     with either a fixed or adaptive strength alpha, then merge with user-specified
+     weights.
+  5. Optionally remove input-side shared modes and apply spectral balancing to the
+     merged parameters for additional stabilization.
+  6. Save the merged weights (and optional serialized model) alongside
+     diagnostic metadata and optional evaluation metrics.
 
-Workflow:
-  1. Load the base image encoder checkpoint (e.g. zeroshot.pt) and compute
-     per-layer gradients on a preserve image set.
-  2. Build per-parameter null-space bases via SVD on the stacked gradients.
-  3. Load finetuned expert checkpoints, project their deltas into the null
-     space, and blend them with user-specified weights.
-  4. Save the merged model and metadata for further evaluation.
+No preserve dataset is required; all computations are data-free.
 """
 
 from __future__ import annotations
@@ -22,16 +26,12 @@ import json
 import math
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import torch
-import torch.nn.functional as F
 import open_clip
-from torch.utils.data import DataLoader, Subset
-from torchvision import transforms as T
-from torchvision.datasets import ImageFolder
-from tqdm.auto import tqdm
+import torch
 
 # Allow importing helper utilities from merge_vit's src package.
 THIS_DIR = Path(__file__).resolve().parent
@@ -39,40 +39,49 @@ SRC_DIR = THIS_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from utils import (
-    safe_load_state_dict,
-    read_config,
+from utils import (  # type: ignore  # noqa: E402
     get_dataset_name,
-)  # type: ignore  # noqa: E402
+    read_config,
+    safe_load_state_dict,
+)
 from eval import eval_single_dataset_30  # type: ignore  # noqa: E402
 
 
 def compile_layer_filter(patterns: Iterable[str]) -> List[re.Pattern]:
-    compiled: List[re.Pattern] = []
-    for pattern in patterns:
-        compiled.append(re.compile(pattern))
-    return compiled
+    return [re.compile(pattern) for pattern in patterns]
 
 
-def _flatten_like(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.reshape(1, -1)
+@dataclass
+class LayerProjectionInfo:
+    left_basis: Optional[torch.Tensor]
+    left_rank: int
+    left_alpha: float
+    left_removed_fraction: float
+    left_projected_norm: float
+    left_stacked_norm: float
+    left_total_energy: float
+    right_basis: Optional[torch.Tensor] = None
+    right_rank: int = 0
+    right_alpha: float = 0.0
+    right_removed_fraction: float = 0.0
+    right_projected_norm: float = 0.0
+    right_stacked_norm: float = 0.0
+    num_experts: int = 0
+    out_dim: int = 0
+    flat_dim: int = 0
 
 
-def _reshape_like(row: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
-    return row.reshape(like.shape)
-
-
-def filter_parameters(
-    model: torch.nn.Module, filters: List[re.Pattern]
-) -> Dict[str, torch.nn.Parameter]:
-    """Select parameters whose names match any regex pattern."""
-    selected: Dict[str, torch.nn.Parameter] = {}
+def filter_parameter_names(model: torch.nn.Module, filters: List[re.Pattern]) -> List[str]:
+    """Return parameter names that are float tensors satisfying the regex filters."""
+    selected: List[str] = []
     for name, param in model.named_parameters():
         if not torch.is_floating_point(param):
             continue
-        if filters and not any(p.search(name) for p in filters):
+        if param.ndim < 2:
+            continue  # skip biases and scalar parameters
+        if filters and not any(pattern.search(name) for pattern in filters):
             continue
-        selected[name] = param
+        selected.append(name)
     if filters and not selected:
         raise ValueError(
             "No parameters matched the provided --layer_regex patterns. "
@@ -81,248 +90,378 @@ def filter_parameters(
     return selected
 
 
-def load_image_dataset(
-    dataset_path: Path,
-    transform,
-    max_samples: Optional[int],
-    seed: int,
-) -> ImageFolder | Subset[ImageFolder]:
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Preserve dataset path not found: {dataset_path}")
-    dataset = ImageFolder(str(dataset_path), transform=transform)
-    if len(dataset) == 0:
-        raise ValueError(f"No images found under {dataset_path}.")
-    if max_samples is not None and max_samples < len(dataset):
-        generator = torch.Generator().manual_seed(seed)
-        indices = torch.randperm(len(dataset), generator=generator)[:max_samples]
-        dataset = Subset(dataset, indices.tolist())
-    return dataset
+def normalize_weights(weights: Sequence[float]) -> List[float]:
+    if len(weights) == 0:
+        raise ValueError("At least one merge weight must be provided.")
+    total = float(sum(weights))
+    if math.isclose(total, 0.0):
+        raise ValueError("Merge weights must sum to a non-zero value.")
+    return [float(w) / total for w in weights]
 
 
-def create_dataloader(
-    dataset,
-    batch_size: int,
-    num_workers: int,
-) -> DataLoader:
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-
-def gather_preserve_gradients(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    parameter_pool: Dict[str, torch.nn.Parameter],
-    device: torch.device,
+def collect_task_vectors(
+    base_state: Dict[str, torch.Tensor],
+    expert_states: Sequence[Dict[str, torch.Tensor]],
+    parameter_names: Sequence[str],
 ) -> Dict[str, List[torch.Tensor]]:
-    model.eval()
-    gradients: Dict[str, List[torch.Tensor]] = {name: [] for name in parameter_pool}
-
-    for images, _ in tqdm(dataloader, desc="Collecting preserve gradients", leave=False):
-        images = images.to(device, non_blocking=True)
-        with torch.no_grad():
-            targets = model(images).detach()
-
-        model.zero_grad(set_to_none=True)
-        outputs = model(images)
-        loss = F.mse_loss(outputs, targets)
-        loss.backward()
-
-        for name, param in parameter_pool.items():
-            grad = param.grad
-            if grad is None:
+    task_vectors: Dict[str, List[torch.Tensor]] = {name: [] for name in parameter_names}
+    for name in parameter_names:
+        base_tensor = base_state[name]
+        out_dim = base_tensor.shape[0]
+        for expert_state in expert_states:
+            expert_tensor = expert_state.get(name)
+            if expert_tensor is None:
                 continue
-            gradients[name].append(grad.detach().flatten().cpu())
+            if expert_tensor.shape != base_tensor.shape:
+                raise ValueError(
+                    f"Shape mismatch for parameter '{name}': base {tuple(base_tensor.shape)} vs "
+                    f"expert {tuple(expert_tensor.shape)}."
+                )
+            delta = expert_tensor - base_tensor
+            task_vectors[name].append(delta.reshape(out_dim, -1))
+    return task_vectors
 
-    return gradients
 
-
-def compute_nullspace_bases(
-    gradients: Dict[str, List[torch.Tensor]],
+def determine_rank(
+    eigenvalues: torch.Tensor,
     max_rank: Optional[int],
-    svd_threshold: float,
-) -> Dict[str, torch.Tensor]:
-    """Compute per-parameter null-space basis via SVD."""
-    bases: Dict[str, torch.Tensor] = {}
-    for name, grad_list in gradients.items():
-        if not grad_list:
+    energy_threshold: Optional[float],
+) -> int:
+    values = eigenvalues.clamp_min(0.0)
+    total_energy = float(values.sum().item())
+    if total_energy <= 0.0:
+        return 0
+
+    if energy_threshold is None:
+        rank = values.numel()
+    else:
+        if not 0.0 < energy_threshold <= 1.0:
+            raise ValueError("--shared_energy must be in the interval (0, 1].")
+        descending = values.flip(0)
+        cumulative = torch.cumsum(descending, dim=0)
+        target = torch.tensor(
+            energy_threshold * total_energy, device=values.device, dtype=values.dtype
+        )
+        idx = int(torch.searchsorted(cumulative, target, right=False).item())
+        rank = min(idx + 1, descending.numel())
+
+    if max_rank is not None:
+        rank = min(rank, max_rank)
+    return max(rank, 0)
+
+
+def compute_alpha(
+    mode: str,
+    basis: Optional[torch.Tensor],
+    stacked: torch.Tensor,
+    alpha_value: float,
+    alpha_scale: float,
+    alpha_min: float,
+    alpha_max: float,
+    eps: float,
+) -> float:
+    if basis is None or basis.numel() == 0:
+        return 0.0
+    if mode == "fixed":
+        alpha = alpha_value
+    else:
+        projected = torch.linalg.vector_norm(basis.t() @ stacked).item()
+        total = torch.linalg.vector_norm(stacked).item()
+        ratio = 0.0 if total <= eps else projected / (total + eps)
+        alpha = alpha_scale * ratio
+    alpha = max(alpha_min, min(alpha_max, alpha))
+    return float(alpha)
+
+
+def build_shared_bases(
+    task_vectors: Dict[str, List[torch.Tensor]],
+    left_max_rank: Optional[int],
+    left_energy_threshold: Optional[float],
+    left_alpha_mode: str,
+    left_alpha_value: float,
+    left_alpha_scale: float,
+    left_alpha_min: float,
+    left_alpha_max: float,
+    right_max_rank: Optional[int],
+    right_energy_threshold: Optional[float],
+    right_alpha_mode: str,
+    right_alpha_value: float,
+    right_alpha_scale: float,
+    right_alpha_min: float,
+    right_alpha_max: float,
+    eps: float,
+) -> Dict[str, LayerProjectionInfo]:
+    projection_infos: Dict[str, LayerProjectionInfo] = {}
+    for name, matrices in task_vectors.items():
+        if not matrices:
             continue
-        G = torch.stack(grad_list, dim=0).float()
+        stacked = torch.cat(matrices, dim=1)  # [out_dim, num_experts * flat_dim]
+        covariance = stacked @ stacked.t()
         try:
-            _, S, Vh = torch.linalg.svd(G, full_matrices=False)
-        except RuntimeError as exc:  # pragma: no cover - unlikely SVD failure
-            raise RuntimeError(f"SVD failed for parameter {name}") from exc
+            eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        except RuntimeError as exc:  # pragma: no cover - numerical fallback
+            raise RuntimeError(f"Failed to compute eigendecomposition for '{name}'.") from exc
 
-        keep_mask = torch.ones_like(S, dtype=torch.bool)
-        if svd_threshold > 0:
-            keep_mask &= (S / S.max()) > svd_threshold
-        if max_rank is not None:
-            keep_mask &= torch.arange(len(S)) < max_rank
+        left_rank = determine_rank(eigenvalues, left_max_rank, left_energy_threshold)
+        left_basis: Optional[torch.Tensor]
+        left_projected_norm = 0.0
+        left_removed_fraction = 0.0
+        stacked_norm = float(torch.linalg.vector_norm(stacked).item())
+        if left_rank > 0:
+            left_basis = eigenvectors[:, -left_rank:].contiguous()
+            projected_component = left_basis @ (left_basis.t() @ stacked)
+            left_projected_norm = float(torch.linalg.vector_norm(projected_component).item())
+            left_removed_fraction = 0.0 if stacked_norm <= eps else left_projected_norm / (stacked_norm + eps)
+        else:
+            left_basis = None
+        left_alpha = compute_alpha(
+            mode=left_alpha_mode,
+            basis=left_basis,
+            stacked=stacked,
+            alpha_value=left_alpha_value,
+            alpha_scale=left_alpha_scale,
+            alpha_min=left_alpha_min,
+            alpha_max=left_alpha_max,
+            eps=eps,
+        )
 
-        rank = int(keep_mask.sum().item())
-        if rank == 0:
+        right_basis: Optional[torch.Tensor] = None
+        right_rank = 0
+        right_projected_norm = 0.0
+        right_removed_fraction = 0.0
+        right_stacked_norm = 0.0
+        if right_max_rank is not None or right_energy_threshold is not None:
+            base_matrix = matrices[0]
+            flat_dim = base_matrix.shape[1]
+            covariance_right = torch.zeros(
+                flat_dim,
+                flat_dim,
+                dtype=base_matrix.dtype,
+                device=base_matrix.device,
+            )
+            for mat in matrices:
+                covariance_right += mat.t() @ mat
+            try:
+                eigenvalues_right, eigenvectors_right = torch.linalg.eigh(covariance_right)
+            except RuntimeError as exc:  # pragma: no cover
+                raise RuntimeError(f"Failed to compute right-side eigendecomposition for '{name}'.") from exc
+            right_rank = determine_rank(eigenvalues_right, right_max_rank, right_energy_threshold)
+            if right_rank > 0:
+                right_basis = eigenvectors_right[:, -right_rank:].contiguous()
+                stacked_right = torch.cat([mat.t() for mat in matrices], dim=1)
+                right_stacked_norm = float(torch.linalg.vector_norm(stacked_right).item())
+                projected_right = right_basis @ (right_basis.t() @ stacked_right)
+                right_projected_norm = float(torch.linalg.vector_norm(projected_right).item())
+                right_removed_fraction = (
+                    0.0 if right_stacked_norm <= eps else right_projected_norm / (right_stacked_norm + eps)
+                )
+                right_alpha = compute_alpha(
+                    mode=right_alpha_mode,
+                    basis=right_basis,
+                    stacked=stacked_right,
+                    alpha_value=right_alpha_value,
+                    alpha_scale=right_alpha_scale,
+                    alpha_min=right_alpha_min,
+                    alpha_max=right_alpha_max,
+                    eps=eps,
+                )
+            else:
+                right_basis = None
+                right_alpha = 0.0
+        else:
+            right_alpha = 0.0
+
+        projection_infos[name] = LayerProjectionInfo(
+            left_basis=left_basis,
+            left_rank=int(left_rank),
+            left_alpha=float(left_alpha),
+            left_removed_fraction=float(left_removed_fraction),
+            left_projected_norm=left_projected_norm,
+            left_stacked_norm=stacked_norm,
+            left_total_energy=float(eigenvalues.clamp_min(0.0).sum().item()),
+            right_basis=right_basis,
+            right_rank=int(right_rank),
+            right_alpha=float(right_alpha),
+            right_removed_fraction=float(right_removed_fraction),
+            right_projected_norm=right_projected_norm,
+            right_stacked_norm=right_stacked_norm,
+            num_experts=len(matrices),
+            out_dim=matrices[0].shape[0],
+            flat_dim=matrices[0].shape[1],
+        )
+    return projection_infos
+
+
+def project_left(delta: torch.Tensor, info: LayerProjectionInfo) -> torch.Tensor:
+    basis = info.left_basis
+    if basis is None or info.left_alpha == 0.0:
+        return delta
+    basis = basis.to(delta.device)
+    reshaped = delta.reshape(info.out_dim, -1)
+    correction = basis @ (basis.t() @ reshaped)
+    projected = reshaped - info.left_alpha * correction
+    return projected.reshape_as(delta)
+
+
+def project_right(delta: torch.Tensor, info: LayerProjectionInfo) -> torch.Tensor:
+    basis = info.right_basis
+    if basis is None or info.right_alpha == 0.0:
+        return delta
+    basis = basis.to(delta.device)
+    reshaped = delta.reshape(info.out_dim, -1)
+    correction = (reshaped @ basis) @ basis.t()
+    projected = reshaped - info.right_alpha * correction
+    return projected.reshape_as(delta)
+
+
+def apply_spectral_balance(
+    merged_tensor: torch.Tensor,
+    expert_weights: List[torch.Tensor],
+    mode: str,
+    clip_lo: float,
+    clip_hi: float,
+    eps: float,
+) -> torch.Tensor:
+    if mode == "none" or merged_tensor.ndim < 2 or not expert_weights:
+        return merged_tensor
+
+    out_dim = merged_tensor.shape[0]
+    mat_merged = merged_tensor.reshape(out_dim, -1).to(torch.float32)
+    min_dim = min(mat_merged.shape[0], mat_merged.shape[1])
+
+    singular_lists: List[torch.Tensor] = []
+    for weight in expert_weights:
+        if weight.ndim < 2:
             continue
-        bases[name] = Vh[:rank, :].contiguous()
-    return bases
-
-
-def compute_svd_preserve_bases(
-    model: torch.nn.Module,
-    parameter_pool: Dict[str, torch.nn.Parameter],
-    max_rank: int,
-) -> Dict[str, torch.Tensor]:
-    """Build preservation bases from dominant singular directions of parameters."""
-    bases: Dict[str, torch.Tensor] = {}
-    state = dict(model.named_parameters())
-    for name in parameter_pool:
-        tensor = state[name].detach()
-        if tensor.ndim < 2:
-            continue
-        flat = tensor.view(tensor.shape[0], -1).float()
-        rank = min(max_rank, flat.shape[0], flat.shape[1])
-        if rank <= 0:
-            continue
+        mat = weight.reshape(out_dim, -1).to(torch.float32)
         try:
-            _, _, Vh = torch.linalg.svd(flat, full_matrices=False)
+            _, s, _ = torch.linalg.svd(mat, full_matrices=False)
         except RuntimeError:
             continue
-        bases[name] = Vh[:rank].contiguous()
-    return bases
+        singular_lists.append(s[:min_dim])
 
+    if not singular_lists:
+        return merged_tensor
 
-def project_delta(
-    delta: torch.Tensor,
-    basis: Optional[torch.Tensor],
-    strength: float,
-) -> torch.Tensor:
-    if basis is None or basis.numel() == 0:
-        return delta
-    original_shape = delta.shape
-    flat = delta.reshape(-1)
-    B = basis.to(flat.device)
-    coeffs = torch.matmul(B, flat)
-    correction = torch.matmul(coeffs, B)
-    flat_proj = flat - strength * correction
-    return flat_proj.reshape(original_shape)
+    stacked_s = torch.stack(singular_lists, dim=0)
 
-def _project_onto_basis(row: torch.Tensor, basis: Optional[torch.Tensor]) -> torch.Tensor:
-    if basis is None or basis.numel() == 0:
-        return row
-    B = basis.to(row.device)
-    return (row @ B.t()) @ B
-
-
-def _remove_basis_component(row: torch.Tensor, basis: Optional[torch.Tensor]) -> torch.Tensor:
-    if basis is None or basis.numel() == 0:
-        return row
-    B = basis.to(row.device)
-    return row - (row @ B.t()) @ B
-
-
-def _proj_guard_and_shared(row: torch.Tensor, guard_basis: Optional[torch.Tensor], shared_basis: Optional[torch.Tensor]) -> torch.Tensor:
-    v = row
-    v = _project_onto_basis(v, shared_basis)
-    v = _remove_basis_component(v, guard_basis)
-    return v
-
-
-def _build_shared_subspace(rows: List[torch.Tensor], rank: int) -> Optional[torch.Tensor]:
-    if rank <= 0 or not rows:
-        return None
-    X = torch.cat(rows, dim=0)
-    if X.shape[0] == 1:
-        vec = F.normalize(X[0], dim=0, eps=1e-6).unsqueeze(0)
-        return vec
-    Xc = X - X.mean(dim=0, keepdim=True)
     try:
-        _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+        U_m, S_m, Vh_m = torch.linalg.svd(mat_merged, full_matrices=False)
     except RuntimeError:
-        return None
-    if Vh.shape[0] == 0:
-        return None
-    r = min(rank, Vh.shape[0])
-    if r <= 0:
-        return None
-    return Vh[:r].contiguous()
+        return merged_tensor
+
+    S_new = S_m.clone()
+    if mode == "gmean":
+        safe_vals = stacked_s.clamp_min(eps)
+        log_vals = torch.log(safe_vals)
+        log_mean = log_vals.mean(dim=0)
+        target = torch.exp(log_mean)
+        S_new[: target.shape[0]] = target
+    elif mode == "clip":
+        lo = torch.quantile(stacked_s, clip_lo, dim=0)
+        hi = torch.quantile(stacked_s, clip_hi, dim=0)
+        lo = lo.clamp_min(eps)
+        hi = torch.maximum(hi, lo + eps)
+        S_new = torch.minimum(torch.maximum(S_new, lo), hi)
+    else:
+        return merged_tensor
+
+    recon = (U_m * S_new.unsqueeze(0)) @ Vh_m
+    return recon.reshape_as(merged_tensor).to(merged_tensor.dtype)
 
 
-def merge_with_nullspace(
+def merge_expert_states(
     base_state: Dict[str, torch.Tensor],
-    expert_states: List[Tuple[Dict[str, torch.Tensor], float]],
-    bases: Dict[str, torch.Tensor],
-    strength: float,
-    apgd_steps: int,
-    apgd_lr: float,
-    shared_rank: int,
-    alpha_mode: str,
-    alpha_beta: float,
+    base_state_f32: Dict[str, torch.Tensor],
+    expert_states: Sequence[Dict[str, torch.Tensor]],
+    projection_infos: Dict[str, LayerProjectionInfo],
+    protected_names: Set[str],
+    normalized_weights: Sequence[float],
+    anchor_index: Optional[int],
+    anchor_scale: float,
+    project_anchor: bool,
+    spectral_mode: str,
+    spectral_clip_lo: float,
+    spectral_clip_hi: float,
+    spectral_eps: float,
 ) -> Dict[str, torch.Tensor]:
     merged: Dict[str, torch.Tensor] = {}
+    num_experts = len(expert_states)
+    if anchor_index is not None and not (0 <= anchor_index < num_experts):
+        raise ValueError(f"--anchor_index {anchor_index} is out of range for {num_experts} experts.")
+
+    other_indices: List[int] = (
+        [idx for idx in range(num_experts) if idx != anchor_index] if anchor_index is not None else list(range(num_experts))
+    )
+
     for name, base_tensor in base_state.items():
         if not torch.is_floating_point(base_tensor):
             merged[name] = base_tensor.clone()
             continue
+        base_f32 = base_state_f32[name]
 
-        base_f32 = base_tensor.to(torch.float32)
-        basis = bases.get(name)
-        rows: List[torch.Tensor] = []
-        row_weights: List[float] = []
-
-        for expert_state, weight in expert_states:
-            if name not in expert_state:
+        deltas: List[Optional[torch.Tensor]] = []
+        expert_actuals: List[Optional[torch.Tensor]] = []
+        for state in expert_states:
+            tensor = state.get(name)
+            if tensor is None:
+                deltas.append(None)
+                expert_actuals.append(None)
                 continue
-            expert_tensor = expert_state[name].to(torch.float32)
-            if expert_tensor.shape != base_f32.shape:
-                print(
-                    f"[warn] Shape mismatch for parameter '{name}': base {tuple(base_f32.shape)} vs expert {tuple(expert_tensor.shape)}. Skipping this expert.",
-                    flush=True,
+            if tensor.shape != base_tensor.shape:
+                raise ValueError(
+                    f"Shape mismatch for parameter '{name}': base {tuple(base_tensor.shape)} vs "
+                    f"expert {tuple(tensor.shape)}."
                 )
-                continue
-            delta = expert_tensor - base_f32
-            delta = project_delta(delta, basis, strength)
-            row = _flatten_like(delta)
-            rows.append(row)
-            row_weights.append(weight)
+            tensor_f32 = tensor.to(torch.float32)
+            expert_actuals.append(tensor_f32)
+            deltas.append(tensor_f32 - base_f32)
 
-        if not rows:
-            merged[name] = base_tensor.clone()
-            continue
+        info = projection_infos.get(name)
+        apply_projection = info is not None and name in protected_names
+        combined = torch.zeros_like(base_f32)
 
-        rows_tensor = torch.cat(rows, dim=0)  # K x F
-        weight_tensor = torch.tensor(row_weights, device=rows_tensor.device, dtype=rows_tensor.dtype).view(-1, 1)
-        weight_tensor = weight_tensor / weight_tensor.sum().clamp_min(1e-12)
-        delta_row = (weight_tensor * rows_tensor).sum(dim=0, keepdim=True)
-
-        shared_basis = _build_shared_subspace(rows, shared_rank)
-
-        if apgd_steps > 0:
-            for _ in range(apgd_steps):
-                if alpha_mode == "uniform":
-                    lam = torch.ones(rows_tensor.shape[0], device=rows_tensor.device, dtype=rows_tensor.dtype)
-                else:
-                    d2 = torch.sum((rows_tensor - delta_row) ** 2, dim=1)
-                    if alpha_mode == "distance":
-                        lam = torch.softmax(alpha_beta * d2, dim=0)
-                    elif alpha_mode == "nci_balanced":
-                        lam = torch.softmax(alpha_beta * d2, dim=0)
-                        mu = rows_tensor.mean(dim=0, keepdim=True)
-                        cos = (F.normalize(rows_tensor, dim=1) @ F.normalize(mu, dim=1).t()).squeeze(1).clamp_min(1e-6)
-                        lam = lam / cos
-                    else:
-                        lam = torch.ones(rows_tensor.shape[0], device=rows_tensor.device, dtype=rows_tensor.dtype)
-                lam = lam / lam.sum().clamp_min(1e-12)
-                grad = 2.0 * torch.sum(lam.view(-1, 1) * (delta_row - rows_tensor), dim=0, keepdim=True)
-                delta_row = delta_row - apgd_lr * grad
-                delta_row = _proj_guard_and_shared(delta_row, basis, shared_basis)
+        if anchor_index is None:
+            for idx, weight in enumerate(normalized_weights):
+                delta = deltas[idx]
+                if delta is None:
+                    continue
+                if apply_projection and info is not None:
+                    delta = project_left(delta, info)
+                    delta = project_right(delta, info)
+                combined += weight * delta
         else:
-            delta_row = _proj_guard_and_shared(delta_row, basis, shared_basis)
+            anchor_delta = deltas[anchor_index]
+            if anchor_delta is not None and anchor_scale != 0.0:
+                if project_anchor and apply_projection and info is not None:
+                    projected_anchor = project_left(anchor_delta, info)
+                    projected_anchor = project_right(projected_anchor, info)
+                    combined += anchor_scale * projected_anchor
+                else:
+                    combined += anchor_scale * anchor_delta
+            for idx in other_indices:
+                delta = deltas[idx]
+                if delta is None:
+                    continue
+                weight = float(normalized_weights[idx])
+                if apply_projection and info is not None:
+                    delta = project_left(delta, info)
+                    delta = project_right(delta, info)
+                combined += weight * delta
 
-        delta_tensor = _reshape_like(delta_row, base_f32)
-        merged[name] = (base_f32 + delta_tensor).to(base_tensor.dtype)
+        merged_tensor = base_f32 + combined
+        if spectral_mode != "none":
+            expert_weights = [w for w in expert_actuals if w is not None]
+            merged_tensor = apply_spectral_balance(
+                merged_tensor=merged_tensor,
+                expert_weights=expert_weights,
+                mode=spectral_mode,
+                clip_lo=spectral_clip_lo,
+                clip_hi=spectral_clip_hi,
+                eps=spectral_eps,
+            )
+
+        merged[name] = merged_tensor.to(base_tensor.dtype)
     return merged
 
 
@@ -339,9 +478,7 @@ def prepare_eval_args(
     if config_root is None:
         return None, None
     if model_name is None or task_name is None:
-        raise ValueError(
-            "Both --eval_model and --eval_task must be provided when --eval_config_root is set."
-        )
+        raise ValueError("Both --eval_model and --eval_task must be provided when --eval_config_root is set.")
 
     eval_namespace = argparse.Namespace(
         config_root_path=config_root,
@@ -374,7 +511,17 @@ def evaluate_merged_encoder(
     device: torch.device,
 ) -> Dict[str, float]:
     image_encoder = torch.load(base_checkpoint, map_location="cpu")
-    image_encoder.load_state_dict(merged_state, strict=False)
+    if isinstance(image_encoder, torch.nn.Module):
+        image_encoder.load_state_dict(merged_state, strict=False)
+    else:
+        state_dict = image_encoder.get("state_dict", image_encoder)
+        pretrained_id = getattr(eval_args, "clip_pretrained", getattr(eval_args, "pretrained", None))
+        image_encoder, _, _ = open_clip.create_model_and_transforms(
+            eval_args.model,
+            pretrained=pretrained_id,
+            device=torch.device("cpu"),
+        )
+        image_encoder.load_state_dict(merged_state, strict=False)
     image_encoder = image_encoder.to(device)
     image_encoder.eval()
 
@@ -413,122 +560,43 @@ def load_base_model(
     return model.to(device=device, dtype=dtype)
 
 
+def parse_dtype(dtype_name: str) -> torch.dtype:
+    mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if dtype_name not in mapping:
+        raise ValueError(f"Unsupported dtype '{dtype_name}'. Choose from {list(mapping)}.")
+    return mapping[dtype_name]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Null-space constrained merging for ViT checkpoints."
+        description="Shared subspace constrained merging for ViT checkpoints."
     )
-    parser.add_argument(
-        "--base_checkpoint",
-        required=True,
-        help="Path to the base image encoder checkpoint (e.g., zeroshot.pt).",
-    )
-    parser.add_argument(
-        "--experts",
-        nargs="+",
-        required=True,
-        help="List of finetuned expert checkpoints to merge.",
-    )
+    parser.add_argument("--base_checkpoint", required=True, help="Path to the base image encoder checkpoint.")
+    parser.add_argument("--experts", nargs="+", required=True, help="List of finetuned expert checkpoints.")
     parser.add_argument(
         "--weights",
         nargs="+",
         type=float,
-        required=True,
-        help="Merge weights (must align with --experts).",
-    )
-    parser.add_argument(
-        "--output_dir",
-        required=True,
-        help="Directory to save merged artifacts.",
-    )
-    parser.add_argument(
-        "--preserve_data",
-        type=Path,
         default=None,
-        help="Directory containing preserve images structured for torchvision ImageFolder.",
+        help="Merge weights (align with experts). Defaults to uniform weights when omitted.",
     )
+    parser.add_argument("--output_dir", required=True, help="Directory to save merged artifacts.")
     parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=512,
-        help="Maximum number of preserve images used to build the null space.",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=16,
-        help="Mini-batch size for preserve gradient collection.",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="Dataloader worker count.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=17,
-        help="Seed used when sub-sampling preserve data.",
-    )
-    parser.add_argument(
-        "--nullspace_strength",
-        type=float,
-        default=1.0,
-        help="Scale of the null-space correction (1.0 fully removes preserved directions).",
-    )
-    parser.add_argument(
-        "--svd_threshold",
-        type=float,
-        default=1e-3,
-        help="Relative singular value threshold for retaining basis vectors.",
-    )
-    parser.add_argument(
-        "--max_rank",
-        type=int,
-        default=None,
-        help="Optional cap on null-space rank per parameter.",
-    )
-    parser.add_argument(
-        "--preserve_mode",
-        choices=["dataset", "svd"],
-        default="dataset",
-        help="Strategy for constructing preservation bases. 'dataset' builds AlphaEdit-style bases from gradients; 'svd' protects dominant singular directions of weights (data-free).",
-    )
-    parser.add_argument(
-        "--svd_rank",
-        type=int,
-        default=8,
-        help="Number of dominant singular directions to preserve when --preserve_mode=svd.",
-    )
-    parser.add_argument(
-        "--apgd_steps",
-        type=int,
-        default=0,
-        help="Number of projected gradient refinement steps in the null-space (0 disables APGD).",
-    )
-    parser.add_argument(
-        "--apgd_lr",
-        type=float,
-        default=0.5,
-        help="Step size for APGD refinement.",
-    )
-    parser.add_argument(
-        "--shared_rank",
-        type=int,
-        default=8,
-        help="Rank of task-shared subspace used during APGD refinement.",
-    )
-    parser.add_argument(
-        "--alpha_mode",
-        choices=["uniform", "distance", "nci_balanced"],
-        default="distance",
-        help="Adaptive coefficient strategy for APGD.",
-    )
-    parser.add_argument(
-        "--alpha_beta",
-        type=float,
-        default=1.0,
-        help="Sharpness parameter for adaptive coefficients when alpha_mode != 'uniform'.",
+        "--layer_regex",
+        nargs="*",
+        default=[
+            r".*attn.*q_proj.weight",
+            r".*attn.*k_proj.weight",
+            r".*attn.*v_proj.weight",
+            r".*attn.*out_proj.weight",
+            r".*mlp.*fc1.weight",
+            r".*mlp.*fc2.weight",
+        ],
+        help="Regex patterns selecting parameters to protect. Empty list keeps all float parameters.",
     )
     parser.add_argument(
         "--clip_model",
@@ -540,201 +608,216 @@ def parse_args() -> argparse.Namespace:
         "--clip_pretrained",
         type=str,
         default=None,
-        help="Optional CLIP pretrained identifier; set to 'openai' for official weights when reconstructing models from state dicts.",
+        help="Optional CLIP pretrained identifier (e.g., 'openai') for reconstructing models from state dicts.",
+    )
+    parser.add_argument("--shared_rank", type=int, default=8, help="Maximum rank of the shared left subspace.")
+    parser.add_argument(
+        "--shared_energy",
+        type=float,
+        default=None,
+        help="Optional cumulative energy threshold (0-1] for selecting shared modes.",
     )
     parser.add_argument(
-        "--layer_regex",
-        nargs="*",
-        default=[
-            r".*attn.*weight",
-            r".*mlp.*weight",
-            r".*attn.*bias",
-            r".*mlp.*bias",
-        ],
-        help="Regex patterns selecting parameters to protect. Empty list keeps all parameters.",
+        "--alpha_mode",
+        choices=["fixed", "adaptive"],
+        default="adaptive",
+        help="Projection strength strategy.",
+    )
+    parser.add_argument("--alpha_value", type=float, default=1.0, help="Fixed projection strength when alpha_mode=fixed.")
+    parser.add_argument("--alpha_scale", type=float, default=1.0, help="Global scale when alpha_mode=adaptive.")
+    parser.add_argument("--alpha_min", type=float, default=0.0, help="Minimum projection strength (after scaling).")
+    parser.add_argument("--alpha_max", type=float, default=1.0, help="Maximum projection strength (after scaling).")
+    parser.add_argument("--right_rank", type=int, default=0, help="Maximum rank of the shared right subspace.")
+    parser.add_argument(
+        "--right_energy",
+        type=float,
+        default=None,
+        help="Optional cumulative energy threshold (0-1] for selecting right-side modes.",
+    )
+    parser.add_argument(
+        "--right_alpha_mode",
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help="Projection strength strategy for the right subspace.",
+    )
+    parser.add_argument("--right_alpha_value", type=float, default=1.0, help="Fixed strength when right_alpha_mode=fixed.")
+    parser.add_argument("--right_alpha_scale", type=float, default=1.0, help="Global scale when right_alpha_mode=adaptive.")
+    parser.add_argument("--right_alpha_min", type=float, default=0.0, help="Minimum right projection strength.")
+    parser.add_argument("--right_alpha_max", type=float, default=1.0, help="Maximum right projection strength.")
+    parser.add_argument(
+        "--spectral_balance",
+        choices=["none", "gmean", "clip"],
+        default="none",
+        help="Optional spectral balancing post-process (geometric mean or quantile clipping).",
+    )
+    parser.add_argument("--spectral_clip_lo", type=float, default=0.05, help="Lower quantile for spectral clipping mode.")
+    parser.add_argument("--spectral_clip_hi", type=float, default=0.95, help="Upper quantile for spectral clipping mode.")
+    parser.add_argument("--eps", type=float, default=1e-6, help="Numerical epsilon for norm ratios.")
+    parser.add_argument(
+        "--anchor_index",
+        type=int,
+        default=None,
+        help="Optional index of the anchor expert (0-based). Its weight in --weights is ignored during merging.",
+    )
+    parser.add_argument(
+        "--anchor_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to the anchor delta (default 1.0 keeps it unchanged).",
+    )
+    parser.add_argument(
+        "--project_anchor",
+        action="store_true",
+        help="Project the anchor update as well (default keeps anchor unprojected).",
     )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device for computing preserve gradients.",
+        help="Device for constructing the shared subspaces.",
     )
     parser.add_argument(
         "--dtype",
         choices=["float32", "float16", "bfloat16"],
-        default="float16",
-        help="Data type used when loading expert checkpoints.",
+        default="float32",
+        help="Data type for instantiating the base model prior to CPU offload.",
     )
-    parser.add_argument(
-        "--save_state_only",
-        action="store_true",
-        help="If set, only save the merged state dict instead of a serialized model.",
-    )
-    parser.add_argument(
-        "--eval_config_root",
-        type=str,
-        default=None,
-        help="Optional config directory used to build evaluation args (e.g., merge_vit/config).",
-    )
-    parser.add_argument(
-        "--eval_model",
-        type=str,
-        default=None,
-        help="Model name (e.g., ViT-B-32) for evaluation config lookup.",
-    )
-    parser.add_argument(
-        "--eval_task",
-        type=str,
-        default=None,
-        help="Task identifier matching the YAML config (e.g., 8 or 30).",
-    )
-    parser.add_argument(
-        "--eval_method",
-        type=str,
-        default="FREE",
-        help="Method tag used when resolving the evaluation YAML file.",
-    )
+    parser.add_argument("--save_state_only", action="store_true", help="Only save the merged state dict.")
+    parser.add_argument("--eval_config_root", type=str, default=None, help="Optional evaluation config directory.")
+    parser.add_argument("--eval_model", type=str, default=None, help="Model name used for evaluation configs.")
+    parser.add_argument("--eval_task", type=str, default=None, help="Task identifier for evaluation configs.")
+    parser.add_argument("--eval_method", type=str, default="FREE", help="Method tag for evaluation config lookup.")
     parser.add_argument(
         "--eval_datasets",
         nargs="*",
         default=None,
         help="Optional subset of datasets to evaluate on; defaults to config-defined set.",
     )
-    parser.add_argument(
-        "--eval_batch_size",
-        type=int,
-        default=None,
-        help="Override evaluation batch size.",
-    )
-    parser.add_argument(
-        "--eval_num_workers",
-        type=int,
-        default=None,
-        help="Override evaluation dataloader worker count.",
-    )
-    parser.add_argument(
-        "--eval_output",
-        type=Path,
-        default=None,
-        help="Path to store evaluation metrics JSON; defaults to <output_dir>/nullspace_eval.json.",
-    )
-    parser.add_argument(
-        "--skip_eval",
-        action="store_true",
-        help="Skip running accuracy evaluation after merging.",
-    )
+    parser.add_argument("--eval_batch_size", type=int, default=None, help="Override evaluation batch size.")
+    parser.add_argument("--eval_num_workers", type=int, default=None, help="Override evaluation dataloader workers.")
+    parser.add_argument("--eval_output", type=Path, default=None, help="Path to store evaluation metrics JSON.")
+    parser.add_argument("--skip_eval", action="store_true", help="Skip post-merge evaluation.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    if len(args.experts) != len(args.weights):
-        raise ValueError("--experts and --weights must have matching lengths.")
+    if args.weights is None:
+        weights = [1.0] * len(args.experts)
+    else:
+        if len(args.experts) != len(args.weights):
+            raise ValueError("--experts and --weights must have matching lengths.")
+        weights = [float(w) for w in args.weights]
+    if not weights:
+        raise ValueError("At least one expert checkpoint must be provided.")
+    if args.shared_energy is not None and not (0.0 < args.shared_energy <= 1.0):
+        raise ValueError("--shared_energy must lie in the interval (0, 1].")
+    if args.right_energy is not None and not (0.0 < args.right_energy <= 1.0):
+        raise ValueError("--right_energy must lie in the interval (0, 1].")
+    if args.alpha_min > args.alpha_max:
+        raise ValueError("--alpha_min must be less than or equal to --alpha_max.")
+    if args.right_alpha_min > args.right_alpha_max:
+        raise ValueError("--right_alpha_min must be less than or equal to --right_alpha_max.")
+    if args.spectral_balance == "clip":
+        if not (0.0 <= args.spectral_clip_lo < args.spectral_clip_hi <= 1.0):
+            raise ValueError("--spectral_clip_lo and --spectral_clip_hi must satisfy 0 <= lo < hi <= 1.")
 
-    weight_sum = sum(args.weights)
-    if math.isclose(weight_sum, 0.0):
-        raise ValueError("Sum of merge weights must be non-zero.")
-    weights = [w / weight_sum for w in args.weights]
-
+    normalized_weights = normalize_weights(weights)
     device = torch.device(args.device)
+    dtype = parse_dtype(args.dtype)
 
-    # Load base model for gradient collection (float32 for stability).
     base_model = load_base_model(
         checkpoint=args.base_checkpoint,
         device=device,
-        dtype=torch.float32,
+        dtype=dtype,
         clip_arch=args.clip_model,
         clip_pretrained=args.clip_pretrained,
     )
     base_model.eval()
 
-    # Determine preserve transform from the model if available.
-    if hasattr(base_model, "val_preprocess"):
-        transform = base_model.val_preprocess
-    elif hasattr(getattr(base_model, "image_encoder", None), "val_preprocess"):
-        transform = base_model.image_encoder.val_preprocess
-    else:
-        # Fallback CLIP-style preprocessing.
-        transform = T.Compose(
-            [
-                T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
-                T.CenterCrop(224),
-                T.ToTensor(),
-                T.Normalize(
-                    mean=(0.48145466, 0.4578275, 0.40821073),
-                    std=(0.26862954, 0.26130258, 0.27577711),
-                ),
-            ]
-        )
-
     parameter_filters = compile_layer_filter(args.layer_regex)
-    parameter_pool = filter_parameters(base_model, parameter_filters)
-    bases: Dict[str, torch.Tensor]
+    protected_names = set(filter_parameter_names(base_model, parameter_filters))
 
-    if args.preserve_mode == "dataset":
-        if not args.preserve_data:
-            raise ValueError("--preserve_data is required when --preserve_mode=dataset.")
-        dataset = load_image_dataset(
-            dataset_path=args.preserve_data,
-            transform=transform,
-            max_samples=args.max_samples,
-            seed=args.seed,
-        )
-        dataloader = create_dataloader(
-            dataset=dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-        gradients = gather_preserve_gradients(
-            model=base_model,
-            dataloader=dataloader,
-            parameter_pool=parameter_pool,
-            device=device,
-        )
-        bases = compute_nullspace_bases(
-            gradients=gradients,
-            max_rank=args.max_rank,
-            svd_threshold=args.svd_threshold,
-        )
-    else:  # svd mode
-        rank = args.svd_rank
-        if args.max_rank is not None:
-            rank = min(rank, args.max_rank)
-        bases = compute_svd_preserve_bases(
-            model=base_model,
-            parameter_pool=parameter_pool,
-            max_rank=rank,
-        )
-
-    base_state = {
-        name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()
+    state_dict = base_model.state_dict()
+    base_state = {name: tensor.detach().cpu() for name, tensor in state_dict.items()}
+    base_state_f32 = {
+        name: tensor.to(torch.float32)
+        for name, tensor in base_state.items()
+        if torch.is_floating_point(tensor)
     }
 
-    # Offload model before loading expert checkpoints to save memory.
-    del parameter_pool
-    base_model_cpu = base_model.to("cpu")
     del base_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    expert_states: List[Tuple[Dict[str, torch.Tensor], float]] = []
-    for expert_path, weight in zip(args.experts, weights):
+    expert_states: List[Dict[str, torch.Tensor]] = []
+    for expert_path in args.experts:
         state = safe_load_state_dict(expert_path)
+        cast_state: Dict[str, torch.Tensor] = {}
         for key, tensor in state.items():
             if torch.is_floating_point(tensor):
-                state[key] = tensor.to(torch.float32)
-        expert_states.append((state, weight))
+                cast_state[key] = tensor.detach().to(torch.float32).cpu()
+            else:
+                cast_state[key] = tensor
+        expert_states.append(cast_state)
 
-    merged_state = merge_with_nullspace(
+    task_vectors = collect_task_vectors(base_state_f32, expert_states, sorted(protected_names))
+    left_max_rank = args.shared_rank if args.shared_rank > 0 else None
+    right_max_rank = args.right_rank if args.right_rank > 0 else None
+    shared_energy = args.shared_energy if args.shared_energy is None else float(args.shared_energy)
+    right_energy = args.right_energy if args.right_energy is None else float(args.right_energy)
+    projection_infos = build_shared_bases(
+        task_vectors=task_vectors,
+        left_max_rank=left_max_rank,
+        left_energy_threshold=shared_energy,
+        left_alpha_mode=args.alpha_mode,
+        left_alpha_value=args.alpha_value,
+        left_alpha_scale=args.alpha_scale,
+        left_alpha_min=args.alpha_min,
+        left_alpha_max=args.alpha_max,
+        right_max_rank=right_max_rank,
+        right_energy_threshold=right_energy,
+        right_alpha_mode=args.right_alpha_mode,
+        right_alpha_value=args.right_alpha_value,
+        right_alpha_scale=args.right_alpha_scale,
+        right_alpha_min=args.right_alpha_min,
+        right_alpha_max=args.right_alpha_max,
+        eps=args.eps,
+    )
+
+    if projection_infos:
+        print("Shared subspace summary:")
+        for name in sorted(projection_infos):
+            info = projection_infos[name]
+            left_pct = info.left_removed_fraction * 100.0
+            message = (
+                f"  {name}: left_rank={info.left_rank}, left_alpha={info.left_alpha:.3f}, "
+                f"left_removed={left_pct:.2f}% (||stack||={info.left_stacked_norm:.3f})"
+            )
+            if info.right_basis is not None and info.right_rank > 0:
+                right_pct = info.right_removed_fraction * 100.0
+                message += (
+                    f", right_rank={info.right_rank}, right_alpha={info.right_alpha:.3f}, "
+                    f"right_removed={right_pct:.2f}%"
+                )
+            print(message)
+    else:
+        print("No shared subspaces were constructed; proceeding with linear merging.")
+
+    merged_state = merge_expert_states(
         base_state=base_state,
+        base_state_f32=base_state_f32,
         expert_states=expert_states,
-        bases=bases,
-        strength=args.nullspace_strength,
-        apgd_steps=args.apgd_steps,
-        apgd_lr=args.apgd_lr,
-        shared_rank=args.shared_rank,
-        alpha_mode=args.alpha_mode,
-        alpha_beta=args.alpha_beta,
+        projection_infos=projection_infos,
+        protected_names=protected_names,
+        normalized_weights=normalized_weights,
+        anchor_index=args.anchor_index,
+        anchor_scale=args.anchor_scale,
+        project_anchor=args.project_anchor,
+        spectral_mode=args.spectral_balance,
+        spectral_clip_lo=args.spectral_clip_lo,
+        spectral_clip_hi=args.spectral_clip_hi,
+        spectral_eps=args.eps,
     )
 
     output_dir = Path(args.output_dir)
@@ -762,7 +845,7 @@ def main() -> None:
                 datasets=eval_datasets,
                 device=device,
             )
-            eval_output_path = args.eval_output or (output_dir / "nullspace_eval.json")
+            eval_output_path = args.eval_output or (output_dir / "shared_subspace_eval.json")
             with eval_output_path.open("w", encoding="utf-8") as f:
                 json.dump(eval_results, f, indent=2)
             print("Post-merge evaluation (top-1 accuracy):")
@@ -771,48 +854,88 @@ def main() -> None:
         else:
             print("Evaluation configuration was requested but could not be prepared; skipping accuracy.")
 
-    merged_state_path = output_dir / "nullspace_merged_state.pt"
+    merged_state_path = output_dir / "shared_subspace_merged_state.pt"
     torch.save(merged_state, merged_state_path)
+
+    layer_stats: Dict[str, Dict[str, object]] = {}
+    for name, info in projection_infos.items():
+        stats_entry: Dict[str, Optional[Dict[str, float]]] = {
+            "left": {
+                "rank": int(info.left_rank),
+                "alpha": float(info.left_alpha),
+                "removed_fraction": float(info.left_removed_fraction),
+                "projected_norm": float(info.left_projected_norm),
+                "stacked_norm": float(info.left_stacked_norm),
+                "total_energy": float(info.left_total_energy),
+            },
+            "right": None,
+            "num_experts": int(info.num_experts),
+            "out_dim": int(info.out_dim),
+            "flat_dim": int(info.flat_dim),
+        }
+        if info.right_basis is not None and info.right_rank > 0:
+            stats_entry["right"] = {
+                "rank": int(info.right_rank),
+                "alpha": float(info.right_alpha),
+                "removed_fraction": float(info.right_removed_fraction),
+                "projected_norm": float(info.right_projected_norm),
+                "stacked_norm": float(info.right_stacked_norm),
+            }
+        layer_stats[name] = stats_entry
 
     metadata = {
         "base_checkpoint": args.base_checkpoint,
         "experts": args.experts,
         "weights": weights,
-        "nullspace_strength": args.nullspace_strength,
-        "svd_threshold": args.svd_threshold,
-        "max_rank": args.max_rank,
-        "preserve_mode": args.preserve_mode,
+        "weights_normalized": normalized_weights,
+        "clip_model": args.clip_model,
+        "clip_pretrained": args.clip_pretrained,
         "layer_regex": args.layer_regex,
-        "protected_layers": {k: int(v.shape[0]) for k, v in bases.items()},
-        "apgd_steps": args.apgd_steps,
-        "apgd_lr": args.apgd_lr,
-        "shared_rank": args.shared_rank,
+        "selected_parameters": sorted(protected_names),
+        "shared_rank_limit": args.shared_rank,
+        "shared_energy": args.shared_energy,
         "alpha_mode": args.alpha_mode,
-        "alpha_beta": args.alpha_beta,
+        "alpha_value": args.alpha_value,
+        "alpha_scale": args.alpha_scale,
+        "alpha_min": args.alpha_min,
+        "alpha_max": args.alpha_max,
+        "right_rank_limit": args.right_rank,
+        "right_energy": args.right_energy,
+        "right_alpha_mode": args.right_alpha_mode,
+        "right_alpha_value": args.right_alpha_value,
+        "right_alpha_scale": args.right_alpha_scale,
+        "right_alpha_min": args.right_alpha_min,
+        "right_alpha_max": args.right_alpha_max,
+        "eps": args.eps,
+        "spectral_balance": args.spectral_balance,
+        "spectral_clip_lo": args.spectral_clip_lo,
+        "spectral_clip_hi": args.spectral_clip_hi,
+        "anchor_index": args.anchor_index,
+        "anchor_scale": args.anchor_scale,
+        "project_anchor": args.project_anchor,
+        "layer_stats": layer_stats,
     }
-    if args.preserve_mode == "dataset":
-        metadata["preserve_data"] = str(args.preserve_data)
-        metadata["max_samples"] = args.max_samples
-        metadata["batch_size"] = args.batch_size
-    else:
-        metadata["svd_rank"] = args.svd_rank
+    if args.anchor_index is not None:
+        metadata["anchor_weight_normalized"] = normalized_weights[args.anchor_index]
     if eval_results is not None and eval_datasets is not None and eval_output_path is not None:
         metadata["evaluation"] = {
             "datasets": eval_datasets,
             "results_path": str(eval_output_path),
             "top1": eval_results,
         }
-    with (output_dir / "nullspace_meta.json").open("w", encoding="utf-8") as f:
+    with (output_dir / "shared_subspace_meta.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
     if not args.save_state_only:
-        # Reload a template model, apply the merged weights, and serialize.
-        template_model = torch.load(args.base_checkpoint, map_location="cpu")
-        template_model.load_state_dict(merged_state, strict=False)
-        torch.save(template_model, output_dir / "nullspace_merged.pt")
-
-    # Restore original base model to avoid side-effects.
-    base_model_cpu.load_state_dict(base_state, strict=False)
+        template = load_base_model(
+            checkpoint=args.base_checkpoint,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            clip_arch=args.clip_model,
+            clip_pretrained=args.clip_pretrained,
+        )
+        template.load_state_dict(merged_state, strict=False)
+        torch.save(template, output_dir / "shared_subspace_merged.pt")
 
 
 if __name__ == "__main__":
